@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Gestão de Trafos - Mapa</title>
+    
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
+    
+    <style>
+        :root {
+            --bg-dark: #0a0a0a;
+            --sidebar-bg: #141414;
+            --accent-green: #00ff88;
+            --accent-red: #ff4444;
+            --accent-blue: #00d9ff;
+            --accent-yellow: #ffee00;
+        }
+
+        body, html { margin: 0; padding: 0; height: 100%; font-family: 'Inter', sans-serif; background: var(--bg-dark); color: white; overflow: hidden; }
+
+        /* Layout */
+        #app-container { display: flex; height: 100vh; width: 100vw; position: relative; }
+
+        /* Sidebar */
+        #sidebar {
+            width: 320px; background: var(--sidebar-bg); height: 100%; border-right: 1px solid #333;
+            transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1); z-index: 2000; display: flex; flex-direction: column;
+        }
+        #sidebar.closed { transform: translateX(-100%); position: absolute; }
+
+        .sidebar-content { padding: 20px; flex-grow: 1; overflow-y: auto; }
+        
+        /* Mapa */
+        #map { flex-grow: 1; height: 100%; background: #000; }
+
+        /* Botão Toggle */
+        #toggle-sidebar {
+            position: absolute; left: 10px; top: 10px; z-index: 2001;
+            background: #222; color: white; border: 1px solid #444; padding: 10px 15px; border-radius: 8px; cursor: pointer;
+        }
+
+        /* Estilo dos Marcadores */
+        .marker-base { border-radius: 50%; border: 2px solid white; box-shadow: 0 0 8px rgba(255,255,255,0.5); transition: all 0.3s; }
+        .marker-user { 
+            background: white; border-radius: 50%; border: 2px solid #fff; 
+            box-shadow: 0 0 15px #fff, 0 0 30px #fff; animation: pulse 2s infinite; 
+        }
+
+        @keyframes pulse { 0% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.3); opacity: 0.7; } 100% { transform: scale(1); opacity: 1; } }
+
+        /* UI Elements */
+        .card { background: #1e1e1e; padding: 15px; border-radius: 12px; margin-bottom: 15px; border: 1px solid #333; }
+        input, select, button { 
+            width: 100%; padding: 12px; margin-top: 8px; border-radius: 6px; 
+            border: 1px solid #333; background: #0a0a0a; color: white; box-sizing: border-box;
+        }
+        button.primary { background: #007bff; border: none; font-weight: 600; cursor: pointer; margin-top: 15px; }
+        button.export { background: #333; border: 1px solid #555; cursor: pointer; }
+
+        @media (max-width: 768px) { #sidebar { width: 85%; position: absolute; } }
+    </style>
+</head>
+<body>
+
+    <button id="toggle-sidebar">☰</button>
+
+    <div id="app-container">
+        <aside id="sidebar">
+            <div class="sidebar-content">
+                <h2 style="font-size: 1.2rem; margin-bottom: 20px; color: #aaa;">Gestão de Trafos</h2>
+                
+                <div class="card">
+                    <label>Seu Nome:</label>
+                    <input type="text" id="user-name" placeholder="Nome do Analista">
+                </div>
+
+                <div class="card">
+                    <label>Subir Nova Base (CSV):</label>
+                    <input type="file" id="upload-csv" accept=".csv">
+                </div>
+
+                <div id="edit-panel" style="display: none;">
+                    <div class="card" style="border-top: 4px solid var(--accent-yellow);">
+                        <p style="margin: 0;">Trafo: <strong id="selected-trafo-id">-</strong></p>
+                        <label style="display: block; margin-top: 10px;">Status:</label>
+                        <select id="status-select">
+                            <option value="pendente">Pendente (Branco)</option>
+                            <option value="apto">Apto (Verde)</option>
+                            <option value="nao_apto">Não Apto (Vermelho)</option>
+                            <option value="instalado">Instalado (Azul)</option>
+                        </select>
+                        <button class="primary" onclick="salvarStatus()">Confirmar Alteração</button>
+                    </div>
+                </div>
+
+                <button class="export" onclick="exportarDados()">Exportar Planilha Atualizada</button>
+            </div>
+        </aside>
+
+        <div id="map"></div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.2/papaparse.min.js"></script>
+
+    <script>
+        // --- CONFIGURAÇÃO SUPABASE ---
+        const SB_URL = 'SUA_URL_DO_SUPABASE';
+        const SB_KEY = 'SUA_KEY_ANON_DO_SUPABASE';
+        const supabase = supabase.createClient(SB_URL, SB_KEY);
+
+        // --- INICIALIZAÇÃO MAPA ---
+        const map = L.map('map', { zoomControl: false }).setView([-5.0919, -42.8034], 13);
+        
+        // Estilo Dark similar à sua imagem (CartoDB Dark Matter)
+        L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+            attribution: '&copy; OpenStreetMap'
+        }).addTo(map);
+
+        let trafoMarkers = {};
+        let selectedId = null;
+
+        // --- LOGICA UI ---
+        document.getElementById('toggle-sidebar').onclick = () => {
+            document.getElementById('sidebar').classList.toggle('closed');
+        };
+
+        // Localização do Usuário (Bolinha Neon)
+        if (navigator.geolocation) {
+            navigator.geolocation.watchPosition(pos => {
+                const { latitude, longitude } = pos.coords;
+                if (window.userMarker) {
+                    window.userMarker.setLatLng([latitude, longitude]);
+                } else {
+                    const neonIcon = L.divIcon({ className: 'marker-user', iconSize: [12, 12] });
+                    window.userMarker = L.marker([latitude, longitude], { icon: neonIcon }).addTo(map);
+                }
+            }, null, { enableHighAccuracy: true });
+        }
+
+        // --- CARREGAR DADOS ---
+        async function carregarPontos() {
+            const { data, error } = await supabase.from('trafos').select('*');
+            if (data) {
+                data.forEach(ponto => addMarker(ponto));
+            }
+        }
+
+        function addMarker(ponto) {
+            let cor = '#fff';
+            if (ponto.status === 'apto') cor = 'var(--accent-green)';
+            if (ponto.status === 'nao_apto') cor = 'var(--accent-red)';
+            if (ponto.status === 'instalado') cor = 'var(--accent-blue)';
+
+            const icon = L.divIcon({
+                className: 'marker-base',
+                html: `<div style="background:${cor}; width:12px; height:12px; border-radius:50%;"></div>`,
+                iconSize: [16, 16]
+            });
+
+            if (trafoMarkers[ponto.id]) map.removeLayer(trafoMarkers[ponto.id]);
+
+            const m = L.marker([ponto.latitude, ponto.longitude], { icon }).addTo(map);
+            
+            m.on('click', () => {
+                // Resetar outros
+                Object.values(trafoMarkers).forEach(marker => marker.getElement().style.borderColor = 'white');
+                // Amarelo ao tocar
+                m.getElement().style.borderColor = 'yellow';
+                m.getElement().style.boxShadow = '0 0 15px yellow';
+                
+                selectedId = ponto.id;
+                document.getElementById('edit-panel').style.display = 'block';
+                document.getElementById('selected-trafo-id').innerText = ponto.numero_trafo;
+                document.getElementById('status-select').value = ponto.status || 'pendente';
+            });
+
+            trafoMarkers[ponto.id] = m;
+        }
+
+        // --- SALVAR E EXPORTAR ---
+        async function salvarStatus() {
+            const status = document.getElementById('status-select').value;
+            const nome = document.getElementById('user-name').value;
+            if (!nome) return alert("Insira seu nome primeiro!");
+
+            const { error } = await supabase.from('trafos')
+                .update({ status: status, analisado_por: nome, data_analise: new Date() })
+                .eq('id', selectedId);
+
+            if (!error) {
+                alert("Atualizado!");
+                carregarPontos();
+            }
+        }
+
+        document.getElementById('upload-csv').onchange = function(e) {
+            const file = e.target.files[0];
+            Papa.parse(file, {
+                header: true,
+                complete: async (results) => {
+                    const toInsert = results.data.map(r => ({
+                        numero_trafo: r.numero,
+                        latitude: parseFloat(r.lat),
+                        longitude: parseFloat(r.lng),
+                        status: 'pendente'
+                    })).filter(r => !isNaN(r.latitude));
+
+                    const { error } = await supabase.from('trafos').insert(toInsert);
+                    if (!error) carregarPontos();
+                }
+            });
+        };
+
+        async function exportarDados() {
+            const { data } = await supabase.from('trafos').select('*');
+            const csv = Papa.unparse(data);
+            const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement("a");
+            link.href = URL.createObjectURL(blob);
+            link.setAttribute("download", "base_trafos_analisada.csv");
+            link.click();
+        }
+
+        carregarPontos();
+    </script>
+</body>
+</html>
